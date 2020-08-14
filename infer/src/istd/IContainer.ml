@@ -1,10 +1,9 @@
 (*
- * Copyright (c) 2018-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *)
-(* Extension of Base.Container, i.e. generic definitions of container operations in terms of fold. *)
 
 open! IStd
 module F = Format
@@ -17,11 +16,9 @@ let singleton_or_more ~fold t =
           match acc with Empty -> Singleton item | _ -> return More ) )
 
 
-let is_singleton ~fold t = match singleton_or_more ~fold t with Singleton _ -> true | _ -> false
-
 let mem_nth ~fold t index =
   With_return.with_return (fun {return} ->
-      let _ : int =
+      let (_ : int) =
         fold t ~init:index ~f:(fun index _ -> if index <= 0 then return true else index - 1)
       in
       false )
@@ -50,7 +47,7 @@ let rev_filter_map_to_list ~fold t ~f =
 
 
 let iter_consecutive ~fold t ~f =
-  let _ : _ option =
+  let (_ : _ option) =
     fold t ~init:None ~f:(fun prev_opt curr ->
         (match prev_opt with Some prev -> f prev curr | None -> ()) ;
         Some curr )
@@ -71,15 +68,26 @@ let filter ~fold ~filter t ~init ~f =
   fold t ~init ~f:(fun acc item -> if filter item then f acc item else acc)
 
 
+let fold_of_pervasives_set_fold fold collection ~init ~f =
+  fold (fun elt accum -> f accum elt) collection init
+
+
 let map ~f:g fold t ~init ~f = fold t ~init ~f:(fun acc item -> f acc (g item))
 
-let fold_of_pervasives_fold ~fold collection ~init ~f =
-  fold (fun item accum -> f accum item) collection init
-
-
-let fold_of_pervasives_map_fold ~fold collection ~init ~f =
+let fold_of_pervasives_map_fold fold collection ~init ~f =
   fold (fun item value accum -> f accum (item, value)) collection init
 
 
 let iter_result ~fold collection ~f =
   Container.fold_result ~fold ~init:() ~f:(fun () item -> f item) collection
+
+
+let fold_result_until ~fold ~init ~f ~finish collection =
+  with_return (fun {return} ->
+      Result.map ~f:finish
+        (Container.fold_result ~fold collection ~init ~f:(fun acc item ->
+             match (f acc item : _ Continue_or_stop.t) with
+             | Continue x ->
+                 x
+             | Stop x ->
+                 return (Result.Ok x) )) )

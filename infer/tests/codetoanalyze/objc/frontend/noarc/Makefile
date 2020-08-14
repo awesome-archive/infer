@@ -1,4 +1,4 @@
-# Copyright (c) 2016-present, Facebook, Inc.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
@@ -40,9 +40,7 @@ SOURCES = \
   ../shared/category_procdesc/main.c \
   ../shared/field_superclass/SuperExample.m \
   ../shared/memory_leaks_benchmark/AutoreleaseExample.m \
-  ../shared/memory_leaks_benchmark/MemoryLeakExample.m \
   ../shared/memory_leaks_benchmark/RetainReleaseExample.m \
-  ../shared/memory_leaks_benchmark/TollBridgeExample.m \
   ../shared/npe/npe_malloc.m \
   ../shared/property/GetterExample.m \
   ../shared/property/PropertyAttributes.m \

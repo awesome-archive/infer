@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2009-2013, Monoidics ltd.
- * Copyright (c) 2013-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -1413,30 +1413,6 @@ int getrusage(int who, struct rusage* r_usage) {
   INFER_EXCLUDE_CONDITION(ret < -1 || ret > 0);
 
   return ret;
-}
-
-#ifdef __APPLE__
-#define gettimeofday_tzp_decl void* __restrict tzp
-#else
-#ifdef __CYGWIN__
-#define gettimeofday_tzp_decl void* __restrict tzp
-#else
-#define gettimeofday_tzp_decl struct timezone* __restrict tzp
-#endif
-#endif
-
-int gettimeofday(struct timeval* __restrict tp, gettimeofday_tzp_decl) {
-  struct timeval tmp_tp;
-  struct timezone tmp_tzp;
-  int success;
-
-  if (tp != 0)
-    *tp = tmp_tp;
-  if (tzp != 0)
-    *(struct timezone*)tzp = tmp_tzp;
-
-  success = __infer_nondet_int();
-  return success ? 0 : -1;
 }
 
 struct tm* localtime_r(const time_t* __restrict timer,

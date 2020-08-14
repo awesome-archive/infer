@@ -1,5 +1,5 @@
 (*
- * Copyright (c) 2018-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -45,8 +45,6 @@ module Degree = struct
     (NonNegativeInt.to_int_exn d.linear * 100) + NonNegativeInt.to_int_exn d.log
 
 
-  let is_zero d = NonNegativeInt.is_zero d.linear && NonNegativeInt.is_zero d.log
-
   let pp f d =
     NonNegativeInt.pp f d.linear ;
     if not (NonNegativeInt.is_zero d.log) then
@@ -56,16 +54,24 @@ end
 module type NonNegativeSymbol = sig
   type t [@@deriving compare]
 
-  val classify : t -> (Ints.NonNegativeInt.t, t) Bounds.valclass
+  val classify : t -> (Ints.NonNegativeInt.t, t, Bounds.BoundTrace.t) Bounds.valclass
 
   val int_lb : t -> NonNegativeInt.t
 
   val int_ub : t -> NonNegativeInt.t option
 
-  val subst :
-    Typ.Procname.t -> Location.t -> t -> Bound.eval_sym -> (NonNegativeInt.t, t) Bounds.valclass
+  val mask_min_max_constant : t -> t
 
-  val pp : F.formatter -> t -> unit
+  val subst :
+       Procname.t
+    -> Location.t
+    -> t
+    -> Bound.eval_sym
+    -> (NonNegativeInt.t, t, Bounds.BoundTrace.t) Bounds.valclass
+
+  val pp : hum:bool -> F.formatter -> t -> unit
+
+  val split_mult : t -> (t * t) option
 end
 
 module type NonNegativeSymbolWithDegreeKind = sig
@@ -78,6 +84,8 @@ module type NonNegativeSymbolWithDegreeKind = sig
   val degree_kind : t -> DegreeKind.t
 
   val symbol : t -> t0
+
+  val split_mult : t -> (t * t) option
 end
 
 module MakeSymbolWithDegreeKind (S : NonNegativeSymbol) :
@@ -92,8 +100,12 @@ module MakeSymbolWithDegreeKind (S : NonNegativeSymbol) :
         Bounds.Constant (DegreeKind.compute degree_kind c)
     | Symbolic _ ->
         Bounds.Symbolic self
-    | ValTop ->
-        Bounds.ValTop
+    | ValTop trace ->
+        Bounds.ValTop trace
+
+
+  let mask_min_max_constant {degree_kind; symbol} =
+    {degree_kind; symbol= S.mask_min_max_constant symbol}
 
 
   let make degree_kind symbol = {degree_kind; symbol}
@@ -104,21 +116,25 @@ module MakeSymbolWithDegreeKind (S : NonNegativeSymbol) :
     S.int_ub symbol |> Option.map ~f:(DegreeKind.compute degree_kind)
 
 
-  let subst callee_pname loc {degree_kind; symbol} eval =
-    match S.subst callee_pname loc symbol eval with
+  let subst callee_pname location {degree_kind; symbol} eval =
+    match S.subst callee_pname location symbol eval with
     | Constant c ->
         Bounds.Constant (DegreeKind.compute degree_kind c)
     | Symbolic symbol ->
         Bounds.Symbolic {degree_kind; symbol}
-    | ValTop ->
-        Bounds.ValTop
+    | ValTop trace ->
+        Logging.d_printfln_escaped "subst(%a) became top." (S.pp ~hum:false) symbol ;
+        Bounds.ValTop trace
 
 
-  let pp f {degree_kind; symbol} = DegreeKind.pp_hole S.pp f degree_kind symbol
+  let pp ~hum f {degree_kind; symbol} = DegreeKind.pp_hole (S.pp ~hum) f degree_kind symbol
 
   let degree_kind {degree_kind} = degree_kind
 
   let symbol {symbol} = symbol
+
+  let split_mult {degree_kind; symbol} =
+    Option.map (S.split_mult symbol) ~f:(fun (s1, s2) -> (make degree_kind s1, make degree_kind s2))
 end
 
 module MakePolynomial (S : NonNegativeSymbolWithDegreeKind) = struct
@@ -159,36 +175,39 @@ module MakePolynomial (S : NonNegativeSymbolWithDegreeKind) = struct
       |> PartialOrder.container ~fold:fold_no_key ~xcompare_elt:(PartialOrder.of_opt ~xcompare_elt)
   end
 
-  (** If x < y < z then
-    2 + 3 * x + 4 * x ^ 2 + x * y + 7 * y ^ 2 * z
-    is represented by
-    {const= 2; terms= {
-      x -> {const= 3; terms= {
-        x -> {const= 4; terms={}},
-        y -> {const= 1; terms={}}
-      }},
-      y -> {const= 0; terms= {
-        y -> {const= 0; terms= {
-          z -> {const= 7; terms={}}
+  (** If x < y < z then [2 + 3 * x + 4 * x ^ 2 + x * y + 7 * y ^ 2 * z] is represented by
+
+      {[
+        {const= 2; terms= {
+          x -> {const= 3; terms= {
+            x -> {const= 4; terms={}},
+            y -> {const= 1; terms={}}
+          }},
+          y -> {const= 0; terms= {
+            y -> {const= 0; terms= {
+              z -> {const= 7; terms={}}
+            }}
+          }}
         }}
-      }}
-    }}
+      ]}
 
-    The representation is a tree, each edge from a node to a child (terms) represents a multiplication by a symbol. If a node has a non-zero const, it represents the multiplication (of the path) by this constant.
-    In the example above, we have the following paths:
-    2
-    x * 3
-    x * x * 4
-    x * y * 1
-    y * y * z * 7
+      The representation is a tree, each edge from a node to a child (terms) represents a
+      multiplication by a symbol. If a node has a non-zero const, it represents the multiplication
+      (of the path) by this constant. In the example above, we have the following paths:
 
-    Invariants:
-      - except for the root, terms <> {} \/ const <> 0
+      - [2]
+      - [x * 3]
+      - [x * x * 4]
+      - [x * y * 1]
+      - [y * y * z * 7]
+
+      Invariants:
+
+      - except for the root, [terms <> {} || const <> 0]
       - symbols children of a term are 'smaller' than its self symbol
       - contents of terms are not zero
-      - symbols in terms are only symbolic values
-  *)
-  type t = {const: NonNegativeInt.t; terms: t M.t}
+      - symbols in terms are only symbolic values *)
+  type t = {const: NonNegativeInt.t; terms: t M.t} [@@deriving compare]
 
   let of_non_negative_int : NonNegativeInt.t -> t = fun const -> {const; terms= M.empty}
 
@@ -197,15 +216,6 @@ module MakePolynomial (S : NonNegativeSymbolWithDegreeKind) = struct
   let one = of_non_negative_int NonNegativeInt.one
 
   let of_int_exn : int -> t = fun i -> i |> NonNegativeInt.of_int_exn |> of_non_negative_int
-
-  let of_valclass : (NonNegativeInt.t, S.t) Bounds.valclass -> t top_lifted = function
-    | ValTop ->
-        Top
-    | Constant i ->
-        NonTop (of_non_negative_int i)
-    | Symbolic s ->
-        NonTop {const= NonNegativeInt.zero; terms= M.singleton s one}
-
 
   let is_zero : t -> bool = fun {const; terms} -> NonNegativeInt.is_zero const && M.is_empty terms
 
@@ -233,7 +243,7 @@ module MakePolynomial (S : NonNegativeSymbolWithDegreeKind) = struct
 
 
   (* (c + r * R + s * S + t * T) x s
-    = 0 + r * (R x s) + s * (c + s * S + t * T) *)
+     = 0 + r * (R x s) + s * (c + s * S + t * T) *)
   let rec mult_symb : t -> S.t -> t =
    fun {const; terms} s ->
     let less_than_s, equal_s_opt, greater_than_s = M.split s terms in
@@ -261,6 +271,26 @@ module MakePolynomial (S : NonNegativeSymbolWithDegreeKind) = struct
       mult_const p1 p2.const |> M.fold (fun s p acc -> plus (mult_symb (mult p p1) s) acc) p2.terms
 
 
+  let rec of_valclass : (NonNegativeInt.t, S.t, 't) Bounds.valclass -> ('t, t, 't) below_above =
+    function
+    | ValTop trace ->
+        Above trace
+    | Constant i ->
+        Val (of_non_negative_int i)
+    | Symbolic s -> (
+      match S.split_mult s with
+      | None ->
+          Val {const= NonNegativeInt.zero; terms= M.singleton s one}
+      | Some (s1, s2) -> (
+        match (of_valclass (S.classify s1), of_valclass (S.classify s2)) with
+        | Val s1, Val s2 ->
+            Val (mult s1 s2)
+        | Below _, _ | _, Below _ ->
+            assert false
+        | (Above _ as t), _ | _, (Above _ as t) ->
+            t ) )
+
+
   let rec int_lb {const; terms} =
     M.fold
       (fun symbol polynomial acc ->
@@ -275,19 +305,18 @@ module MakePolynomial (S : NonNegativeSymbolWithDegreeKind) = struct
       (fun symbol polynomial acc ->
         Option.bind acc ~f:(fun acc ->
             Option.bind (S.int_ub symbol) ~f:(fun s_ub ->
-                Option.map (int_ub polynomial) ~f:(fun p_ub -> NonNegativeInt.((s_ub * p_ub) + acc))
-            ) ) )
+                Option.map (int_ub polynomial) ~f:(fun p_ub -> NonNegativeInt.((s_ub * p_ub) + acc)) ) )
+        )
       terms (Some const)
 
 
   (* assumes symbols are not comparable *)
-  let rec ( <= ) : lhs:t -> rhs:t -> bool =
+  let rec leq : lhs:t -> rhs:t -> bool =
    fun ~lhs ~rhs ->
     phys_equal lhs rhs
-    || NonNegativeInt.( <= ) ~lhs:lhs.const ~rhs:rhs.const
-       && M.le ~le_elt:( <= ) lhs.terms rhs.terms
+    || (NonNegativeInt.leq ~lhs:lhs.const ~rhs:rhs.const && M.le ~le_elt:leq lhs.terms rhs.terms)
     || Option.exists (int_ub lhs) ~f:(fun lhs_ub ->
-           NonNegativeInt.( <= ) ~lhs:lhs_ub ~rhs:(int_lb rhs) )
+           NonNegativeInt.leq ~lhs:lhs_ub ~rhs:(int_lb rhs) )
 
 
   let rec xcompare ~lhs ~rhs =
@@ -298,13 +327,16 @@ module MakePolynomial (S : NonNegativeSymbolWithDegreeKind) = struct
     PartialOrder.join cmp_const cmp_terms
 
 
-  (* Possible optimization for later: x join x^2 = x^2 instead of x + x^2 *)
-  let rec join : t -> t -> t =
-   fun p1 p2 ->
-    if phys_equal p1 p2 then p1
-    else
-      { const= NonNegativeInt.max p1.const p2.const
-      ; terms= M.increasing_union ~f:join p1.terms p2.terms }
+  let rec mask_min_max_constant {const; terms} =
+    { const
+    ; terms=
+        M.fold
+          (fun s p acc ->
+            let p' = mask_min_max_constant p in
+            M.update (S.mask_min_max_constant s)
+              (function None -> Some p' | Some p -> if leq ~lhs:p ~rhs:p' then Some p' else Some p)
+              acc )
+          terms M.empty }
 
 
   (* assumes symbols are not comparable *)
@@ -320,17 +352,13 @@ module MakePolynomial (S : NonNegativeSymbolWithDegreeKind) = struct
         if is_constant p1 then p1 else if is_constant p2 then p2 else p1
 
 
-  let widen : prev:t -> next:t -> num_iters:int -> t =
-   fun ~prev:_ ~next:_ ~num_iters:_ -> assert false
-
-
-  let subst callee_pname loc =
-    let exception ReturnTop in
+  let subst callee_pname location =
+    let exception ReturnTop of (S.t * Bounds.BoundTrace.t) in
     (* avoids top-lifting everything *)
     let rec subst {const; terms} eval_sym =
       M.fold
         (fun s p acc ->
-          match S.subst callee_pname loc s eval_sym with
+          match S.subst callee_pname location s eval_sym with
           | Constant c -> (
             match PositiveInt.of_big_int (c :> Z.t) with
             | None ->
@@ -338,75 +366,76 @@ module MakePolynomial (S : NonNegativeSymbolWithDegreeKind) = struct
             | Some c ->
                 let p = subst p eval_sym in
                 mult_const_positive p c |> plus acc )
-          | ValTop ->
+          | ValTop trace ->
               let p = subst p eval_sym in
-              if is_zero p then acc else raise ReturnTop
+              if is_zero p then acc else raise (ReturnTop (s, trace))
           | Symbolic s ->
               let p = subst p eval_sym in
               mult_symb p s |> plus acc )
         terms (of_non_negative_int const)
     in
-    fun p eval_sym -> match subst p eval_sym with p -> NonTop p | exception ReturnTop -> Top
+    fun p eval_sym ->
+      match subst p eval_sym with p -> Val p | exception ReturnTop s_trace -> Above s_trace
 
 
-  (** Emit a pair (d,t) where d is the degree of the polynomial and t is the first term with such degree *)
+  (** Emit a pair (d,t) where d is the degree of the polynomial and t is the first term with such
+      degree *)
   let rec degree_with_term {terms} =
     M.fold
-      (fun t p acc ->
+      (fun t p cur_max ->
         let d, p' = degree_with_term p in
-        max acc (Degree.succ (S.degree_kind t) d, mult_symb p' t) )
+        let degree_term = (Degree.succ (S.degree_kind t) d, mult_symb p' t) in
+        if [%compare: Degree.t * t] degree_term cur_max > 0 then degree_term else cur_max )
       terms (Degree.zero, one)
 
 
   let degree p = fst (degree_with_term p)
 
-  let degree_term p = snd (degree_with_term p)
-
   let multiplication_sep = F.sprintf " %s " SpecialChars.multiplication_sign
 
-  let pp : F.formatter -> t -> unit =
+  let pp : hum:bool -> F.formatter -> t -> unit =
     let add_symb s (((last_s, last_occ) as last), others) =
       if Int.equal 0 (S.compare s last_s) then ((last_s, PositiveInt.succ last_occ), others)
       else ((s, PositiveInt.one), last :: others)
     in
     let pp_coeff fmt (c : NonNegativeInt.t) =
-      if Z.((c :> Z.t) > one) then
+      if Z.(gt (c :> Z.t) one) then
         F.fprintf fmt "%a %s " NonNegativeInt.pp c SpecialChars.dot_operator
     in
     let pp_exp fmt (e : PositiveInt.t) =
-      if Z.((e :> Z.t) > one) then PositiveInt.pp_exponent fmt e
+      if Z.(gt (e :> Z.t) one) then PositiveInt.pp_exponent fmt e
     in
     let pp_magic_parentheses pp fmt x =
       let s = F.asprintf "%a" pp x in
       if String.contains s ' ' then F.fprintf fmt "(%s)" s else F.pp_print_string fmt s
     in
-    let pp_symb fmt symb = pp_magic_parentheses S.pp fmt symb in
-    let pp_symb_exp fmt (symb, exp) = F.fprintf fmt "%a%a" pp_symb symb pp_exp exp in
-    let pp_symbs fmt (last, others) =
-      List.rev_append others [last] |> Pp.seq ~sep:multiplication_sep pp_symb_exp fmt
+    let pp_symb ~hum fmt symb = pp_magic_parentheses (S.pp ~hum) fmt symb in
+    let pp_symb_exp ~hum fmt (symb, exp) = F.fprintf fmt "%a%a" (pp_symb ~hum) symb pp_exp exp in
+    let pp_symbs ~hum fmt (last, others) =
+      List.rev_append others [last] |> Pp.seq ~sep:multiplication_sep (pp_symb_exp ~hum) fmt
     in
-    let rec pp_sub ~print_plus symbs fmt {const; terms} =
+    let rec pp_sub ~hum ~print_plus symbs fmt {const; terms} =
       let print_plus =
         if not (NonNegativeInt.is_zero const) then (
           if print_plus then F.pp_print_string fmt " + " ;
-          F.fprintf fmt "%a%a" pp_coeff const pp_symbs symbs ;
+          F.fprintf fmt "%a%a" pp_coeff const (pp_symbs ~hum) symbs ;
           true )
         else print_plus
       in
       ( M.fold
           (fun s p print_plus ->
-            pp_sub ~print_plus (add_symb s symbs) fmt p ;
+            pp_sub ~hum ~print_plus (add_symb s symbs) fmt p ;
             true )
           terms print_plus
         : bool )
       |> ignore
     in
-    fun fmt {const; terms} ->
+    fun ~hum fmt {const; terms} ->
       let const_not_zero = not (NonNegativeInt.is_zero const) in
       if const_not_zero || M.is_empty terms then NonNegativeInt.pp fmt const ;
       ( M.fold
           (fun s p print_plus ->
-            pp_sub ~print_plus ((s, PositiveInt.one), []) fmt p ;
+            pp_sub ~hum ~print_plus ((s, PositiveInt.one), []) fmt p ;
             true )
           terms const_not_zero
         : bool )
@@ -420,94 +449,285 @@ module MakePolynomial (S : NonNegativeSymbolWithDegreeKind) = struct
     get_symbols_sub p []
 end
 
+module NonNegativeBoundWithDegreeKind = MakeSymbolWithDegreeKind (Bounds.NonNegativeBound)
+module NonNegativeNonTopPolynomial = MakePolynomial (NonNegativeBoundWithDegreeKind)
+
+module TopTrace = struct
+  module S = NonNegativeBoundWithDegreeKind
+
+  type t =
+    | UnboundedLoop of {bound_trace: Bounds.BoundTrace.t}
+    | UnboundedSymbol of {location: Location.t; symbol: S.t; bound_trace: Bounds.BoundTrace.t}
+    | Call of {location: Location.t; callee_pname: Procname.t; callee_trace: t}
+  [@@deriving compare]
+
+  let rec length = function
+    | UnboundedLoop {bound_trace} | UnboundedSymbol {bound_trace} ->
+        1 + Bounds.BoundTrace.length bound_trace
+    | Call {callee_trace} ->
+        1 + length callee_trace
+
+
+  let compare t1 t2 = [%compare: int * t] (length t1, t1) (length t2, t2)
+
+  let unbounded_loop bound_trace = UnboundedLoop {bound_trace}
+
+  let unbounded_symbol ~location ~symbol bound_trace =
+    UnboundedSymbol {location; symbol; bound_trace}
+
+
+  let call ~location ~callee_pname callee_trace = Call {location; callee_pname; callee_trace}
+
+  let rec pp f = function
+    | UnboundedLoop {bound_trace} ->
+        F.fprintf f "%a -> UnboundedLoop" Bounds.BoundTrace.pp bound_trace
+    | UnboundedSymbol {location; symbol; bound_trace} ->
+        F.fprintf f "%a -> UnboundedSymbol (%a): %a" Bounds.BoundTrace.pp bound_trace Location.pp
+          location (S.pp ~hum:false) symbol
+    | Call {callee_pname; callee_trace; location} ->
+        F.fprintf f "%a -> Call `%a` (%a)" pp callee_trace Procname.pp callee_pname Location.pp
+          location
+
+
+  let rec make_err_trace ~depth trace =
+    match trace with
+    | UnboundedLoop {bound_trace} ->
+        let bound_err_trace = Bounds.BoundTrace.make_err_trace ~depth bound_trace in
+        [("Unbounded loop", bound_err_trace)] |> Errlog.concat_traces
+    | UnboundedSymbol {location; symbol; bound_trace} ->
+        let desc = F.asprintf "Unbounded value %a" (S.pp ~hum:true) symbol in
+        Errlog.make_trace_element depth location desc []
+        :: Bounds.BoundTrace.make_err_trace ~depth bound_trace
+    | Call {location; callee_pname; callee_trace} ->
+        let desc = F.asprintf "Call to %a" Procname.pp callee_pname in
+        Errlog.make_trace_element depth location desc []
+        :: make_err_trace ~depth:(depth + 1) callee_trace
+end
+
+module TopTraces = struct
+  include AbstractDomain.MinReprSet (TopTrace)
+
+  let make_err_trace traces =
+    match min_elt traces with None -> [] | Some trace -> TopTrace.make_err_trace ~depth:0 trace
+end
+
+module UnreachableTrace = struct
+  type t =
+    | UnreachableNode of Location.t
+    | Call of {location: Location.t; callee_pname: Procname.t; callee_trace: t}
+  [@@deriving compare]
+
+  let rec length = function
+    | UnreachableNode _ ->
+        1
+    | Call {callee_trace} ->
+        1 + length callee_trace
+
+
+  let compare t1 t2 = [%compare: int * t] (length t1, t1) (length t2, t2)
+
+  let unreachable_node node_loc = UnreachableNode node_loc
+
+  let call ~location ~callee_pname callee_trace = Call {location; callee_pname; callee_trace}
+
+  let rec pp f = function
+    | UnreachableNode node_loc ->
+        F.fprintf f "UnreachableNode (%a)" Location.pp node_loc
+    | Call {callee_pname; callee_trace; location} ->
+        F.fprintf f "%a -> Call `%a` (%a)" pp callee_trace Procname.pp callee_pname Location.pp
+          location
+
+
+  let rec make_err_trace ~depth trace =
+    match trace with
+    | UnreachableNode node_loc ->
+        [Errlog.make_trace_element depth node_loc "Unreachable node" []]
+    | Call {location; callee_pname; callee_trace} ->
+        let desc = F.asprintf "Call to %a" Procname.pp callee_pname in
+        Errlog.make_trace_element depth location desc []
+        :: make_err_trace ~depth:(depth + 1) callee_trace
+end
+
+module UnreachableTraces = struct
+  include AbstractDomain.MinReprSet (UnreachableTrace)
+
+  let make_err_trace traces =
+    match min_elt traces with
+    | None ->
+        []
+    | Some trace ->
+        UnreachableTrace.make_err_trace ~depth:0 trace
+end
+
 module NonNegativePolynomial = struct
-  module NonNegativeBoundWithDegreeKind = MakeSymbolWithDegreeKind (Bounds.NonNegativeBound)
-  module NonNegativeNonTopPolynomial = MakePolynomial (NonNegativeBoundWithDegreeKind)
-  include AbstractDomain.TopLifted (NonNegativeNonTopPolynomial)
+  (* Use Above for Top values, Below for Unreachable values with their trace, and Val for non-negative polynomials *)
+  type t = (UnreachableTraces.t, NonNegativeNonTopPolynomial.t, TopTraces.t) below_above
 
-  let zero = NonTop NonNegativeNonTopPolynomial.zero
+  type degree_with_term =
+    ( UnreachableTraces.t
+    , Degree.t * NonNegativeNonTopPolynomial.t
+    , TopTraces.t )
+    AbstractDomain.Types.below_above
 
-  let one = NonTop NonNegativeNonTopPolynomial.one
+  let leq =
+    AbstractDomain.StackedUtils.leq ~leq_below:UnreachableTraces.leq
+      ~leq:NonNegativeNonTopPolynomial.leq ~leq_above:TopTraces.leq
 
-  let of_int_exn i = NonTop (NonNegativeNonTopPolynomial.of_int_exn i)
+
+  let pp ~hum =
+    let pp_below f traces =
+      AbstractDomain.BottomLiftedUtils.pp_bottom f ;
+      if not hum then F.fprintf f ": %a" UnreachableTraces.pp traces
+    in
+    let pp_above f traces =
+      AbstractDomain.TopLiftedUtils.pp_top f ;
+      if not hum then F.fprintf f ": %a" TopTraces.pp traces
+    in
+    AbstractDomain.StackedUtils.pp ~pp:(NonNegativeNonTopPolynomial.pp ~hum) ~pp_above ~pp_below
+
+
+  let pp_hum = pp ~hum:true
+
+  let pp = pp ~hum:false
+
+  let top = Above TopTraces.bottom
+
+  let zero = Val NonNegativeNonTopPolynomial.zero
+
+  let one = Val NonNegativeNonTopPolynomial.one
+
+  let of_unreachable node_loc =
+    Below (UnreachableTraces.singleton (UnreachableTrace.unreachable_node node_loc))
+
+
+  let of_int_exn i = Val (NonNegativeNonTopPolynomial.of_int_exn i)
+
+  let make_trace_set ~map_above =
+    AbstractDomain.StackedUtils.map
+      ~f_below:(fun _ -> assert false)
+      ~f:Fn.id
+      ~f_above:(fun above -> TopTraces.singleton (map_above above))
+
 
   let of_non_negative_bound ?(degree_kind = DegreeKind.Linear) b =
     b
     |> NonNegativeBoundWithDegreeKind.make degree_kind
     |> NonNegativeBoundWithDegreeKind.classify |> NonNegativeNonTopPolynomial.of_valclass
+    (* Invariant: we always get a non-below bound from [of_valclass] *)
+    |> make_trace_set ~map_above:TopTrace.unbounded_loop
 
 
-  let is_symbolic = function Top -> false | NonTop p -> NonNegativeNonTopPolynomial.is_symbolic p
+  let is_symbolic = function
+    | Below _ | Above _ ->
+        false
+    | Val p ->
+        NonNegativeNonTopPolynomial.is_symbolic p
 
-  let is_top = function Top -> true | _ -> false
 
-  let is_zero = function NonTop p when NonNegativeNonTopPolynomial.is_zero p -> true | _ -> false
+  let is_top = function Above _ -> true | _ -> false
 
-  let is_one = function NonTop p when NonNegativeNonTopPolynomial.is_one p -> true | _ -> false
+  let is_unreachable = function Below _ -> true | _ -> false
+
+  let is_zero = function Val p when NonNegativeNonTopPolynomial.is_zero p -> true | _ -> false
+
+  let is_one = function Val p when NonNegativeNonTopPolynomial.is_one p -> true | _ -> false
 
   let top_lifted_increasing ~f p1 p2 =
-    match (p1, p2) with Top, _ | _, Top -> Top | NonTop p1, NonTop p2 -> NonTop (f p1 p2)
+    AbstractDomain.StackedUtils.combine ~f_below:UnreachableTraces.join ~dir:`Increasing p1 p2 ~f
+      ~f_above:TopTraces.join
+
+
+  let unreachable_lifted_increasing ~f p1 p2 =
+    match (p1, p2) with
+    | (Below _ as below), _ | _, (Below _ as below) ->
+        below
+    | _ ->
+        top_lifted_increasing ~f p1 p2
 
 
   let plus = top_lifted_increasing ~f:NonNegativeNonTopPolynomial.plus
 
+  let mult_unreachable = unreachable_lifted_increasing ~f:NonNegativeNonTopPolynomial.mult
+
   let mult = top_lifted_increasing ~f:NonNegativeNonTopPolynomial.mult
 
   let min_default_left p1 p2 =
-    match (p1, p2) with
-    | Top, x | x, Top ->
-        x
-    | NonTop p1, NonTop p2 ->
-        NonTop (NonNegativeNonTopPolynomial.min_default_left p1 p2)
+    AbstractDomain.StackedUtils.combine ~dir:`Decreasing p1 p2
+      ~f:NonNegativeNonTopPolynomial.min_default_left ~f_above:TopTraces.join
+      ~f_below:UnreachableTraces.join
 
 
-  let widen ~prev ~next ~num_iters:_ = if ( <= ) ~lhs:next ~rhs:prev then prev else Top
-
-  let subst callee_pname loc p eval_sym =
+  let subst callee_pname location p eval_sym =
     match p with
-    | Top ->
-        Top
-    | NonTop p ->
-        NonNegativeNonTopPolynomial.subst callee_pname loc p eval_sym
+    | Above callee_traces ->
+        Above
+          (TopTraces.map
+             (fun callee_trace -> TopTrace.call ~callee_pname ~location callee_trace)
+             callee_traces)
+    | Below callee_traces ->
+        Below
+          (UnreachableTraces.map
+             (fun callee_trace -> UnreachableTrace.call ~callee_pname ~location callee_trace)
+             callee_traces)
+    | Val p ->
+        NonNegativeNonTopPolynomial.subst callee_pname location p eval_sym
+        |> make_trace_set ~map_above:(fun (symbol, bound_trace) ->
+               TopTrace.unbounded_symbol ~location ~symbol bound_trace )
 
 
   let degree p =
-    match p with Top -> None | NonTop p -> Some (NonNegativeNonTopPolynomial.degree p)
+    match p with Above _ | Below _ -> None | Val p -> Some (NonNegativeNonTopPolynomial.degree p)
 
 
-  let compare_by_degree p1 p2 =
-    match (p1, p2) with
-    | Top, Top ->
-        0
-    | Top, NonTop _ ->
-        1
-    | NonTop _, Top ->
-        -1
-    | NonTop p1, NonTop p2 ->
+  let compare_by_degree =
+    let cmp _ _ = 0 (* All pairs of Top/Unreachable should be considered equal *) in
+    AbstractDomain.StackedUtils.compare ~cmp_above:cmp
+      ~cmp:(fun p1 p2 ->
         Degree.compare
           (NonNegativeNonTopPolynomial.degree p1)
-          (NonNegativeNonTopPolynomial.degree p2)
+          (NonNegativeNonTopPolynomial.degree p2) )
+      ~cmp_below:cmp
 
 
-  let pp_degree fmt p =
-    match p with
-    | Top ->
+  let get_degree_with_term =
+    AbstractDomain.StackedUtils.map ~f:NonNegativeNonTopPolynomial.degree_with_term ~f_above:Fn.id
+      ~f_below:Fn.id
+
+
+  let get_symbols =
+    AbstractDomain.StackedUtils.map ~f:NonNegativeNonTopPolynomial.get_symbols ~f_above:Fn.id
+      ~f_below:Fn.id
+
+
+  let pp_degree ~only_bigO fmt = function
+    | Above _ ->
         Format.pp_print_string fmt "Top"
-    | NonTop p ->
-        Degree.pp fmt (NonNegativeNonTopPolynomial.degree p)
+    | Below _ ->
+        Format.pp_print_string fmt "Unreachable"
+    | Val (degree, degree_term) ->
+        if only_bigO then
+          Format.fprintf fmt "O(%a)"
+            (NonNegativeNonTopPolynomial.pp ~hum:true)
+            (NonNegativeNonTopPolynomial.mask_min_max_constant degree_term)
+        else Degree.pp fmt degree
 
 
-  let pp_degree_hum fmt p =
-    match p with
-    | Top ->
-        Format.pp_print_string fmt "Top"
-    | NonTop p ->
-        Format.fprintf fmt "O(%a)" NonNegativeNonTopPolynomial.pp
-          (NonNegativeNonTopPolynomial.degree_term p)
+  let degree_str p =
+    match degree p with
+    | Some degree ->
+        Format.asprintf ", degree = %a" Degree.pp degree
+    | None ->
+        ""
 
 
-  let get_symbols p : Bounds.NonNegativeBound.t list =
-    match p with Top -> assert false | NonTop p -> NonNegativeNonTopPolynomial.get_symbols p
+  let polynomial_traces p =
+    match get_symbols p with
+    | Below trace ->
+        UnreachableTraces.make_err_trace trace
+    | Val symbols ->
+        List.map symbols ~f:Bounds.NonNegativeBound.make_err_trace |> Errlog.concat_traces
+    | Above trace ->
+        TopTraces.make_err_trace trace
 
 
   let encode astate = Marshal.to_string astate [] |> Base64.encode_exn

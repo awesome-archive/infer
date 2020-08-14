@@ -1,5 +1,5 @@
 (*
- * Copyright (c) 2018-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -17,14 +17,42 @@ module Degree : sig
 
   val encode_to_int : t -> int
   (** Encodes the complex type [t] to an integer that can be used for comparison. *)
+end
 
-  val is_zero : t -> bool
+module NonNegativeNonTopPolynomial : sig
+  type t
 
-  val pp : Format.formatter -> t -> unit
+  val get_symbols : t -> Bounds.NonNegativeBound.t list
+end
+
+module TopTraces : sig
+  type t
+
+  val make_err_trace : t -> Errlog.loc_trace
+end
+
+module UnreachableTraces : sig
+  type t
+
+  val make_err_trace : t -> Errlog.loc_trace
 end
 
 module NonNegativePolynomial : sig
-  include AbstractDomain.WithTop
+  include PrettyPrintable.PrintableType
+
+  type degree_with_term =
+    ( UnreachableTraces.t
+    , Degree.t * NonNegativeNonTopPolynomial.t
+    , TopTraces.t )
+    AbstractDomain.Types.below_above
+
+  val pp_hum : Format.formatter -> t -> unit
+
+  val leq : lhs:t -> rhs:t -> bool
+
+  val top : t
+
+  val of_unreachable : Location.t -> t
 
   val zero : t
 
@@ -36,6 +64,8 @@ module NonNegativePolynomial : sig
 
   val is_top : t -> bool
 
+  val is_unreachable : t -> bool
+
   val is_zero : t -> bool
 
   val is_one : t -> bool
@@ -44,23 +74,28 @@ module NonNegativePolynomial : sig
 
   val plus : t -> t -> t
 
+  val mult_unreachable : t -> t -> t
+  (** if one of the operands is unreachable, the result is unreachable *)
+
   val mult : t -> t -> t
 
   val min_default_left : t -> t -> t
 
-  val subst : Typ.Procname.t -> Location.t -> t -> Bound.eval_sym -> t
+  val subst : Procname.t -> Location.t -> t -> Bound.eval_sym -> t
 
   val degree : t -> Degree.t option
 
+  val degree_str : t -> string
+
   val compare_by_degree : t -> t -> int
 
-  val pp_degree : Format.formatter -> t -> unit
+  val pp_degree : only_bigO:bool -> Format.formatter -> degree_with_term -> unit
 
-  val pp_degree_hum : Format.formatter -> t -> unit
+  val polynomial_traces : t -> Errlog.loc_trace
 
   val encode : t -> string
 
   val decode : string -> t
 
-  val get_symbols : t -> Bounds.NonNegativeBound.t list
+  val get_degree_with_term : t -> degree_with_term
 end

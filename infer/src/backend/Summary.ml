@@ -1,6 +1,6 @@
 (*
  * Copyright (c) 2009-2013, Monoidics ltd.
- * Copyright (c) 2013-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -8,7 +8,7 @@
 
 open! IStd
 module F = Format
-open PolyVariantEqual
+module L = Logging
 
 module Stats = struct
   type t =
@@ -23,17 +23,11 @@ module Stats = struct
 
   let add_visited stats node_id = stats.nodes_visited <- IntSet.add node_id stats.nodes_visited
 
-  let nb_visited {nodes_visited} = IntSet.cardinal nodes_visited
-
   let update ?(add_symops = 0) ?failure_kind stats =
     let symops = stats.symops + add_symops in
     let failure_kind = match failure_kind with None -> stats.failure_kind | some -> some in
     {stats with symops; failure_kind}
 
-
-  let failure_kind {failure_kind} = failure_kind
-
-  let symops {symops} = symops
 
   let pp_failure_kind_opt fmt failure_kind_opt =
     match failure_kind_opt with
@@ -42,8 +36,6 @@ module Stats = struct
     | None ->
         F.pp_print_string fmt "NONE"
 
-
-  let failure_kind_to_string {failure_kind} = F.asprintf "%a" pp_failure_kind_opt failure_kind
 
   let pp fmt {failure_kind; symops} =
     F.fprintf fmt "FAILURE:%a SYMOPS:%d@\n" pp_failure_kind_opt failure_kind symops
@@ -61,13 +53,22 @@ module Status = struct
   let is_analyzed = function Analyzed -> true | _ -> false
 end
 
-type t =
-  { payloads: Payloads.t
-  ; sessions: int ref
-  ; stats: Stats.t
-  ; status: Status.t
-  ; proc_desc: Procdesc.t
-  ; err_log: Errlog.t }
+include struct
+  (* ignore dead modules added by @@deriving fields *)
+  [@@@warning "-60"]
+
+  type t =
+    { payloads: Payloads.t
+    ; mutable sessions: int
+    ; stats: Stats.t
+    ; status: Status.t
+    ; proc_desc: Procdesc.t
+    ; err_log: Errlog.t
+    ; mutable callee_pnames: Procname.Set.t }
+  [@@deriving fields]
+end
+
+type full_summary = t
 
 let get_status summary = summary.status
 
@@ -85,12 +86,6 @@ let get_err_log summary = summary.err_log
 
 let get_loc summary = (get_attributes summary).ProcAttributes.loc
 
-type cache = t Typ.Procname.Hash.t
-
-let cache : cache = Typ.Procname.Hash.create 128
-
-let clear_cache () = Typ.Procname.Hash.clear cache
-
 let pp_errlog fmt err_log =
   F.fprintf fmt "ERRORS: @[<h>%a@]@\n%!" Errlog.pp_errors err_log ;
   F.fprintf fmt "WARNINGS: @[<h>%a@]" Errlog.pp_warnings err_log
@@ -98,11 +93,9 @@ let pp_errlog fmt err_log =
 
 let pp_signature fmt summary =
   let pp_formal fmt (p, typ) = F.fprintf fmt "%a %a" (Typ.pp_full Pp.text) typ Mangled.pp p in
-  F.fprintf fmt "%a %a(%a)" (Typ.pp_full Pp.text) (get_ret_type summary) Typ.Procname.pp
+  F.fprintf fmt "%a %a(%a)" (Typ.pp_full Pp.text) (get_ret_type summary) Procname.pp
     (get_proc_name summary) (Pp.seq ~sep:", " pp_formal) (get_formals summary)
 
-
-let get_signature summary = F.asprintf "%a" pp_signature summary
 
 let pp_no_stats_specs fmt summary =
   F.fprintf fmt "%a@\n" pp_signature summary ;
@@ -117,7 +110,7 @@ let pp_text fmt summary =
 
 let pp_html source fmt summary =
   F.pp_force_newline fmt () ;
-  Io_infer.Html.with_color Black pp_no_stats_specs fmt summary ;
+  Pp.html_with_color Black pp_no_stats_specs fmt summary ;
   F.fprintf fmt "<br />%a<br />@\n" Stats.pp summary.stats ;
   Errlog.pp_html source [] fmt (get_err_log summary) ;
   Io_infer.Html.pp_hline fmt () ;
@@ -126,145 +119,269 @@ let pp_html source fmt summary =
   F.fprintf fmt "</LISTING>@\n"
 
 
-(** Add the summary to the table for the given function *)
-let add (proc_name : Typ.Procname.t) (summary : t) : unit =
-  Typ.Procname.Hash.replace cache proc_name summary
+module ReportSummary = struct
+  type t = {loc: Location.t; cost_opt: CostDomain.summary option; err_log: Errlog.t}
+
+  let of_full_summary (f : full_summary) =
+    ({loc= get_loc f; cost_opt= f.payloads.Payloads.cost; err_log= f.err_log} : t)
 
 
-let specs_filename pname =
-  let pname_file = Typ.Procname.to_filename pname in
-  pname_file ^ Config.specs_files_suffix
+  module SQLite = SqliteUtils.MarshalledDataNOTForComparison (struct
+    type nonrec t = t
+  end)
+end
+
+module AnalysisSummary = struct
+  include struct
+    (* ignore dead modules added by @@deriving fields *)
+    [@@@warning "-60"]
+
+    type t =
+      { payloads: Payloads.t
+      ; mutable sessions: int
+      ; stats: Stats.t
+      ; status: Status.t
+      ; proc_desc: Procdesc.t
+      ; mutable callee_pnames: Procname.Set.t }
+    [@@deriving fields]
+  end
+
+  let of_full_summary (f : full_summary) =
+    ( { payloads= f.payloads
+      ; sessions= f.sessions
+      ; stats= f.stats
+      ; status= f.status
+      ; proc_desc= f.proc_desc
+      ; callee_pnames= f.callee_pnames }
+      : t )
 
 
-(** path to the .specs file for the given procedure in the current results directory *)
-let res_dir_specs_filename pname =
-  DB.Results_dir.path_to_filename DB.Results_dir.Abs_root
-    [Config.specs_dir_name; specs_filename pname]
+  module SQLite = SqliteUtils.MarshalledDataNOTForComparison (struct
+    type nonrec t = t
+  end)
+end
+
+let mk_full_summary (report_summary : ReportSummary.t) (analysis_summary : AnalysisSummary.t) =
+  ( { payloads= analysis_summary.payloads
+    ; sessions= analysis_summary.sessions
+    ; stats= analysis_summary.stats
+    ; status= analysis_summary.status
+    ; proc_desc= analysis_summary.proc_desc
+    ; callee_pnames= analysis_summary.callee_pnames
+    ; err_log= report_summary.err_log }
+    : full_summary )
 
 
-(** paths to the .specs file for the given procedure in the current spec libraries *)
-let specs_library_filename specs_dir pname =
-  DB.filename_from_string (Filename.concat specs_dir (specs_filename pname))
+module OnDisk = struct
+  type cache = t Procname.Hash.t
+
+  let cache : cache = Procname.Hash.create 128
+
+  let clear_cache () = Procname.Hash.clear cache
+
+  (** Remove an element from the cache of summaries. Contrast to reset which re-initializes a
+      summary keeping the same Procdesc and updates the cache accordingly. *)
+  let remove_from_cache pname = Procname.Hash.remove cache pname
+
+  (** Add the summary to the table for the given function *)
+  let add (proc_name : Procname.t) (summary : t) : unit =
+    Procname.Hash.replace cache proc_name summary
 
 
-(** paths to the .specs file for the given procedure in the models folder *)
-let specs_models_filename pname =
-  DB.filename_from_string (Filename.concat Config.models_dir (specs_filename pname))
+  let specs_filename_and_crc pname =
+    let pname_file, crc = Procname.to_filename_and_crc pname in
+    (pname_file ^ Config.specs_files_suffix, crc)
 
 
-let has_model pname = Sys.file_exists (DB.filename_to_string (specs_models_filename pname)) = `Yes
+  let specs_filename pname = specs_filename_and_crc pname |> fst
 
-let summary_serializer : t Serialization.serializer =
-  Serialization.create_serializer Serialization.Key.summary
+  (** Return the path to the .specs file for the given procedure in the current results directory *)
+  let specs_filename_of_procname pname =
+    let filename, crc = specs_filename_and_crc pname in
+    let sharded_filename =
+      if Serialization.is_shard_mode then
+        let shard_dirs =
+          String.sub crc ~pos:0 ~len:Config.specs_shard_depth
+          |> String.concat_map ~sep:"/" ~f:Char.to_string
+        in
+        shard_dirs ^/ filename
+      else filename
+    in
+    DB.filename_from_string (ResultsDir.get_path Specs ^/ sharded_filename)
 
 
-(** Load procedure summary from the given file *)
-let load_from_file specs_file = Serialization.read_from_file summary_serializer specs_file
+  (** paths to the .specs file for the given procedure in the models folder *)
+  let specs_models_filename pname =
+    DB.filename_from_string (Filename.concat Config.biabduction_models_dir (specs_filename pname))
 
-(** Load procedure summary for the given procedure name and update spec table *)
-let load_summary_to_spec_table =
-  let rec or_load_summary_libs specs_dirs proc_name summ_opt =
-    match (summ_opt, specs_dirs) with
-    | Some _, _ | _, [] ->
-        summ_opt
-    | None, specs_dir :: specs_dirs ->
-        load_from_file (specs_library_filename specs_dir proc_name)
-        |> or_load_summary_libs specs_dirs proc_name
-  in
-  let load_summary_ziplibs zip_specs_filename =
-    let zip_specs_path = Filename.concat Config.specs_dir_name zip_specs_filename in
-    ZipLib.load summary_serializer zip_specs_path
-  in
-  let or_from f_load f_filenames proc_name summ_opt =
-    match summ_opt with Some _ -> summ_opt | None -> f_load (f_filenames proc_name)
-  in
-  fun proc_name ->
+
+  let summary_serializer : t Serialization.serializer =
+    Serialization.create_serializer Serialization.Key.summary
+
+
+  (** Load procedure summary from the given file *)
+  let load_from_file specs_file =
+    BackendStats.incr_summary_file_try_load () ;
+    let opt = Serialization.read_from_file summary_serializer specs_file in
+    if Option.is_some opt then BackendStats.incr_summary_read_from_disk () ;
+    opt
+
+
+  let spec_of_model proc_name = load_from_file (specs_models_filename proc_name)
+
+  let spec_of_procname =
+    let load_statement =
+      ResultsDatabase.register_statement
+        "SELECT analysis_summary, report_summary FROM specs WHERE proc_name = :k"
+    in
+    fun proc_name ->
+      ResultsDatabase.with_registered_statement load_statement ~f:(fun db load_stmt ->
+          Sqlite3.bind load_stmt 1 (Procname.SQLite.serialize proc_name)
+          |> SqliteUtils.check_result_code db ~log:"load proc specs bind proc_name" ;
+          SqliteUtils.result_option ~finalize:false db ~log:"load proc specs run" load_stmt
+            ~read_row:(fun stmt ->
+              let analysis_summary = Sqlite3.column stmt 0 |> AnalysisSummary.SQLite.deserialize in
+              let report_summary = Sqlite3.column stmt 1 |> ReportSummary.SQLite.deserialize in
+              mk_full_summary report_summary analysis_summary ) )
+
+
+  (** Load procedure summary for the given procedure name and update spec table *)
+  let load_summary_to_spec_table proc_name =
     let summ_opt =
-      load_from_file (res_dir_specs_filename proc_name)
-      |> or_from load_from_file specs_models_filename proc_name
-      |> or_from load_summary_ziplibs specs_filename proc_name
-      |> or_load_summary_libs Config.specs_library proc_name
+      match spec_of_procname proc_name with
+      | None when BiabductionModels.mem proc_name ->
+          spec_of_model proc_name
+      | summ_opt ->
+          summ_opt
     in
     Option.iter ~f:(add proc_name) summ_opt ;
     summ_opt
 
 
-let get proc_name =
-  try Some (Typ.Procname.Hash.find cache proc_name) with Caml.Not_found ->
-    load_summary_to_spec_table proc_name
+  let get proc_name =
+    match Procname.Hash.find cache proc_name with
+    | summary ->
+        BackendStats.incr_summary_cache_hits () ;
+        Some summary
+    | exception Caml.Not_found ->
+        BackendStats.incr_summary_cache_misses () ;
+        load_summary_to_spec_table proc_name
 
 
-(** Check if the procedure is from a library:
-    It's not defined, and there is no spec file for it. *)
-let proc_is_library proc_attributes =
-  if not proc_attributes.ProcAttributes.is_defined then
-    match get proc_attributes.ProcAttributes.proc_name with None -> true | Some _ -> false
-  else false
+  (** Try to find the attributes for a defined proc. First look at specs (to get attributes computed
+      by analysis) then look at the attributes table. If no attributes can be found, return None. *)
+  let proc_resolve_attributes proc_name =
+    match get proc_name with
+    | Some summary ->
+        Some (get_attributes summary)
+    | None ->
+        Attributes.load proc_name
 
 
-(** Try to find the attributes for a defined proc.
-    First look at specs (to get attributes computed by analysis)
-    then look at the attributes table.
-    If no attributes can be found, return None.
-*)
-let proc_resolve_attributes proc_name =
-  match get proc_name with
-  | Some summary ->
-      Some (get_attributes summary)
-  | None ->
-      Attributes.load proc_name
+  (** Save summary for the procedure into the spec database *)
+  let store (summ : t) =
+    let final_summary = {summ with status= Status.Analyzed} in
+    let proc_name = get_proc_name final_summary in
+    (* Make sure the summary in memory is identical to the saved one *)
+    add proc_name final_summary ;
+    if Config.biabduction_models_mode then
+      Serialization.write_to_file summary_serializer
+        (specs_filename_of_procname proc_name)
+        ~data:final_summary
+    else
+      let analysis_summary = AnalysisSummary.of_full_summary final_summary in
+      let report_summary = ReportSummary.of_full_summary final_summary in
+      DBWriter.store_spec
+        ~proc_name:(Procname.SQLite.serialize proc_name)
+        ~analysis_summary:(AnalysisSummary.SQLite.serialize analysis_summary)
+        ~report_summary:(ReportSummary.SQLite.serialize report_summary)
 
 
-(** Save summary for the procedure into the spec database *)
-let store (summ : t) =
-  let final_summary = {summ with status= Status.Analyzed} in
-  let proc_name = get_proc_name final_summary in
-  (* Make sure the summary in memory is identical to the saved one *)
-  add proc_name final_summary ;
-  Serialization.write_to_file summary_serializer
-    (res_dir_specs_filename proc_name)
-    ~data:final_summary
+  let reset proc_desc =
+    let summary =
+      { sessions= 0
+      ; payloads= Payloads.empty
+      ; stats= Stats.empty
+      ; status= Status.Pending
+      ; proc_desc
+      ; err_log= Errlog.empty ()
+      ; callee_pnames= Procname.Set.empty }
+    in
+    Procname.Hash.replace cache (Procdesc.get_proc_name proc_desc) summary ;
+    summary
 
 
-let init_summary proc_desc =
-  let summary =
-    { sessions= ref 0
-    ; payloads= Payloads.empty
-    ; stats= Stats.empty
-    ; status= Status.Pending
-    ; proc_desc
-    ; err_log= Errlog.empty () }
-  in
-  Typ.Procname.Hash.replace cache (Procdesc.get_proc_name proc_desc) summary ;
-  summary
+  let reset_all ~filter () =
+    let reset proc_name =
+      spec_of_procname proc_name
+      |> Option.iter ~f:(fun summary ->
+             let blank_summary = reset summary.proc_desc in
+             store blank_summary )
+    in
+    Procedures.get_all ~filter () |> List.iter ~f:reset
 
 
-let dummy =
-  let dummy_attributes =
-    ProcAttributes.default (SourceFile.invalid __FILE__) Typ.Procname.empty_block
-  in
-  let dummy_proc_desc = Procdesc.from_proc_attributes dummy_attributes in
-  init_summary dummy_proc_desc
+  let delete pname =
+    remove_from_cache pname ;
+    if Config.biabduction_models_mode then
+      let filename = specs_filename_of_procname pname |> DB.filename_to_string in
+      (* Unix_error is raised if the file isn't present so do nothing in this case *)
+      try Unix.unlink filename with Unix.Unix_error _ -> ()
+    else DBWriter.delete_spec ~proc_name:(Procname.SQLite.serialize pname)
 
 
-(** Reset a summary rebuilding the dependents and preserving the proc attributes if present. *)
-let reset proc_desc = init_summary proc_desc
+  let iter_filtered_specs ~filter ~f =
+    let db = ResultsDatabase.get_database () in
+    let dummy_source_file = SourceFile.invalid __FILE__ in
+    (* NB the order is deterministic, but it is over a serialised value, so it is arbitrary *)
+    Sqlite3.prepare db
+      "SELECT proc_name, analysis_summary, report_summary FROM specs ORDER BY proc_name ASC"
+    |> Container.iter ~fold:(SqliteUtils.result_fold_rows db ~log:"iter over filtered specs")
+         ~f:(fun stmt ->
+           let proc_name = Sqlite3.column stmt 0 |> Procname.SQLite.deserialize in
+           if filter dummy_source_file proc_name then
+             let analysis_summary = Sqlite3.column stmt 1 |> AnalysisSummary.SQLite.deserialize in
+             let report_summary = Sqlite3.column stmt 2 |> ReportSummary.SQLite.deserialize in
+             let spec = mk_full_summary report_summary analysis_summary in
+             f spec )
 
-let reset_all ~filter () =
-  let reset proc_name =
-    let filename = res_dir_specs_filename proc_name in
-    Serialization.read_from_file summary_serializer filename
-    |> Option.iter ~f:(fun summary ->
-           let blank_summary = reset summary.proc_desc in
-           Serialization.write_to_file summary_serializer filename ~data:blank_summary )
-  in
-  Procedures.get_all ~filter () |> List.iter ~f:reset
+
+  let iter_filtered_report_summaries ~filter ~f =
+    let db = ResultsDatabase.get_database () in
+    let dummy_source_file = SourceFile.invalid __FILE__ in
+    (* NB the order is deterministic, but it is over a serialised value, so it is arbitrary *)
+    Sqlite3.prepare db "SELECT proc_name, report_summary FROM specs ORDER BY proc_name ASC"
+    |> Container.iter ~fold:(SqliteUtils.result_fold_rows db ~log:"iter over filtered specs")
+         ~f:(fun stmt ->
+           let proc_name = Sqlite3.column stmt 0 |> Procname.SQLite.deserialize in
+           if filter dummy_source_file proc_name then
+             let ({loc; cost_opt; err_log} : ReportSummary.t) =
+               Sqlite3.column stmt 1 |> ReportSummary.SQLite.deserialize
+             in
+             f proc_name loc cost_opt err_log )
 
 
-module SummaryValue = struct
-  type nonrec t = t option
+  let make_filtered_iterator_from_config ~iter ~f =
+    let filter =
+      if Option.is_some Config.procedures_filter then (
+        if Config.test_filtering then (
+          Inferconfig.test () ;
+          L.exit 0 ) ;
+        Lazy.force Filtering.procedures_filter )
+      else fun _ _ -> true
+    in
+    iter ~filter ~f
 
-  let label = "summary"
+
+  let iter_report_summaries_from_config ~f =
+    make_filtered_iterator_from_config ~iter:iter_filtered_report_summaries ~f
+
+
+  let iter_specs_from_config ~f = make_filtered_iterator_from_config ~iter:iter_filtered_specs ~f
+
+  let iter_specs ~f = iter_filtered_specs ~filter:(fun _ _ -> true) ~f
+
+  let pp_specs_from_config fmt =
+    iter_specs_from_config ~f:(fun summary ->
+        F.fprintf fmt "Procedure: %a@\n%a@." Procname.pp (get_proc_name summary) pp_text summary )
 end
-
-module SummaryServer = Memcached.Make (SummaryValue)
